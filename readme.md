@@ -4,8 +4,7 @@ Life Calendar es un generador de fondos de pantalla dinámicos para iOS que comb
 
 Está diseñado para ofrecer una **visualización pasiva de tus prioridades diarias**. Cada vez que bloqueas tu iPhone, ves exactamente qué debes hacer, ordenado de forma inteligente.
 
-![Demo Banner](https://lifecal-virid.vercel.app/months?height=2556&width=1179) 
-*(Aquí puedes subir un pantallazo de tu iPhone con el wallpaper puesto y cambiar este link)*
+![Demo Banner](https://i.imgur.com/PpoZ2QI.png)
 
 ## ✨ Características
 
