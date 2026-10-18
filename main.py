@@ -1,19 +1,22 @@
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse
+from notion import obtener_tareas
+from generator import crear_imagen
 
 app = FastAPI(title="Life Wallpaper API")
 
-@app.get("/", response_class=HTMLResponse)
-def leer_raiz():
-    return """
-    <html>
-        <head><title>Life Wallpaper</title></head>
-        <body style="background-color: black; color: white; text-align: center; font-family: sans-serif; padding-top: 20%;">
-            <h1>🚀 Servidor Activo</h1>
-            <p>Esperando la conexión del iPhone...</p>
-        </body>
-    </html>
-    """
-
-# Para correr el servidor localmente ejecuta:
-# uvicorn main:app --reload
+@app.get("/wallpaper", response_class=FileResponse)
+def generar_wallpaper():
+    print("1. Obteniendo tareas de Notion...")
+    tareas = obtener_tareas()
+    
+    if not tareas:
+        tareas = ["¡Día libre!", "No hay tareas pendientes para hoy."]
+        
+    print("2. Generando imagen...")
+    output_file = "current_wallpaper.png"
+    crear_imagen(tareas, output_file)
+    
+    print("3. Imagen enviada al iPhone.")
+    # FileResponse le dice al navegador/iPhone que descargue el archivo como imagen
+    return FileResponse(output_file, media_type="image/png")

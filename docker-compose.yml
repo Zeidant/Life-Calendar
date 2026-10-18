@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  life-wallpaper:
+    build: .
+    container_name: life-wallpaper-api
+    ports:
+      - "2211:2211"
+    env_file:
+      - .env
+    restart: unless-stopped
+    # Ajusta la zona horaria a la tuya para que el texto "Domingo, 18 Oct" coincida con tu país
+    environment:
+      - TZ=America/Santo_Domingo
