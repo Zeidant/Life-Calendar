@@ -9,6 +9,7 @@ services:
     env_file:
       - .env
     restart: unless-stopped
-    # Ajusta la zona horaria a la tuya para que el texto "Domingo, 18 Oct" coincida con tu país
     environment:
       - TZ=America/Santo_Domingo
+    volumes:
+      - ./fondos:/app/fondos
