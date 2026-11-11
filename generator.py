@@ -1,6 +1,10 @@
 from playwright.sync_api import sync_playwright
+import base64
 import datetime
+import functools
 import html
+import mimetypes
+import os
 
 CALENDAR_URL = "https://lifecal-virid.vercel.app/months?height=2556&width=1179"
 MAX_TAREAS = 5  # más que esto empezaría a subir hacia el calendario
@@ -13,6 +17,24 @@ CAL_TOP = 450      # y (px) donde queda el borde superior del calendario (la eti
 # Medidas del calendario sin escalar (lifecal 1179x2556), tomadas de la captura
 CAL_ORIG_TOP = 885
 CAL_ORIG_ANCHO = 721
+
+# --- Imagen de fondo (Gojo) ---
+# Pon la imagen junto a este archivo con el nombre gojo.jpg (o cambia GOJO_IMG).
+# Si el archivo no existe, el wallpaper se genera igual que antes, sin imagen.
+GOJO_IMG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "./gojo.jpg")
+GOJO_BRILLO = 0.5  # 1.0 = original; baja para que el calendario y las tareas resalten más
+GOJO_BLUR = 0      # px de desenfoque (0 = nítido; prueba 6-10 para un fondo más suave)
+
+
+@functools.lru_cache(maxsize=1)
+def _gojo_data_uri():
+    """Lee la imagen una sola vez y la incrusta como data URI.
+    (Con set_content, Chromium no deja cargar archivos locales file://)"""
+    if not os.path.exists(GOJO_IMG):
+        return None
+    mime = mimetypes.guess_type(GOJO_IMG)[0] or "image/jpeg"
+    with open(GOJO_IMG, "rb") as f:
+        return f"data:{mime};base64," + base64.b64encode(f.read()).decode()
 
 
 def crear_imagen(tareas, output_path="wallpaper.png"):
@@ -97,6 +119,27 @@ def crear_imagen(tareas, output_path="wallpaper.png"):
     more_html = f"<div class='more'>+{extra} más</div>" if extra > 0 else ""
     fecha_hoy = datetime.datetime.now().strftime("%A, %d %b")
 
+    gojo_uri = _gojo_data_uri()
+    if gojo_uri:
+        capas_gojo = "<div class='gojo'></div><div class='shade'></div>"
+        css_gojo = f"""
+            .gojo {{
+                position: absolute; inset: -{GOJO_BLUR * 2}px;
+                background: url('{gojo_uri}') no-repeat center / cover;
+                filter: brightness({GOJO_BRILLO}) blur({GOJO_BLUR}px);
+            }}
+            /* Oscurece la parte baja para que la lista de tareas se lea bien */
+            .shade {{
+                position: absolute; inset: 0;
+                background: linear-gradient(to bottom, rgba(26,26,26,0) 55%, rgba(26,26,26,0.9) 100%);
+            }}
+        """
+        # El fondo del calendario es oscuro y opaco: con "screen" lo oscuro deja ver la imagen
+        # y los puntos claros se mantienen.
+        mezcla = "mix-blend-mode: screen;"
+    else:
+        capas_gojo = css_gojo = mezcla = ""
+
     html_content = f"""
     <!DOCTYPE html>
     <html>
@@ -113,10 +156,13 @@ def crear_imagen(tareas, output_path="wallpaper.png"):
                 position: relative; overflow: hidden;
             }}
 
+            {css_gojo}
+
             .bg {{
                 position: absolute; inset: 0;
                 background: url('{CALENDAR_URL}') no-repeat center center;
                 filter: grayscale(1);
+                {mezcla}
                 transform-origin: 50% {CAL_ORIG_TOP}px;
                 transform: translateY({desplazamiento_y}px) scale({CAL_ESCALA});
             }}
@@ -171,6 +217,7 @@ def crear_imagen(tareas, output_path="wallpaper.png"):
         </style>
     </head>
     <body>
+        {capas_gojo}
         <div class="bg"></div>
         <div class="tasks-container">
             <div class="header">
