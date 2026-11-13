@@ -1,28 +1,45 @@
 from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from PIL import Image, ImageStat
 from string import Template
 import base64
 import datetime
 import functools
+import glob
 import html
 import io
+import logging
 import os
 
-CALENDAR_URL = "https://lifecal-virid.vercel.app/months?height=2556&width=1179"
+import requests
+
+log = logging.getLogger("wallpaper")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Aquí se guardan el calendario descargado y el último wallpaper bueno (monta esta carpeta como volumen)
+CACHE_DIR = os.getenv("CACHE_DIR", os.path.join(BASE_DIR, "cache"))
+# Si pones aquí un Inter*.woff2 / Inter*.ttf, se usa sin necesitar internet (si no, Google Fonts)
+ASSETS_DIR = os.path.join(BASE_DIR, "assets")
+
+# --- Pantalla: iPhone 17 (1206 x 2622) ---
+ANCHO, ALTO = 1206, 2622
+# Tamaño con el que se pide el calendario a lifecal y con el que se tomaron las medidas de abajo.
+# Después se escala a la pantalla, así no dependemos de cómo reparta lifecal otros tamaños.
+REF_W, REF_H = 1179, 2556
+CALENDAR_URL = f"https://lifecal-virid.vercel.app/months?height={REF_H}&width={REF_W}"
 MAX_TAREAS = 5  # más que esto empezaría a subir hacia el calendario
 MAX_DONE = 2    # lugares reservados para las Done de hoy (0 = que nunca roben espacio)
 
-ANCHO, ALTO = 1179, 2556
-
 # --- Tamaño y posición del calendario ---
 CAL_ESCALA = 1.3   # 1.0 = tamaño original
-CAL_TOP = 450      # y (px) donde queda el borde superior del calendario (la etiqueta "Jan")
+CAL_TOP = round(450 * ALTO / REF_H)  # y (px de la pantalla) del borde superior del calendario ("Jan")
 
 # Medidas del calendario sin escalar (lifecal 1179x2556), tomadas de la captura
 CAL_ORIG_TOP = 885
 CAL_ORIG_BOTTOM = 1980  # aprox. donde termina el texto "75d left · 79%"
 CAL_ORIG_ANCHO = 721
 CAL_ORIG_PIE = 1900  # y (sin escalar) desde donde empieza el texto de abajo ("75d left · 79%")
+ESCALA_REAL = CAL_ESCALA * (ANCHO / REF_W)  # CAL_ESCALA ya aplicado al tamaño de esta pantalla
 
 # --- Fondo con imagen (opcional) ---
 # El calendario de lifecal trae un fondo oscuro OPACO (26,26,26). Para poder mezclarlo con una
@@ -52,6 +69,124 @@ h1 { color: #444444; }
 .task-in-progress .task-title { color: #000000; }
 .task-done .status-indicator { background: rgba(0,0,0,0.55); border-color: transparent; }
 """
+
+
+# ============================================================ FECHAS EN ESPAÑOL
+DIAS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+MESES_ES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
+
+
+def _fecha_hoy_es(hoy):
+    """Ejemplo: 'Miércoles, 12 nov'."""
+    return f"{DIAS_ES[hoy.weekday()].capitalize()}, {hoy.day} {MESES_ES[hoy.month - 1]}"
+
+
+# ============================================================ FECHA DE ENTREGA POR TAREA (opcional)
+# Muestra "hoy", "mañana", "vie 14", "21 nov" o "vencida hace 2 d" a la derecha de cada tarea.
+# Para quitarla:
+#   - rápido:  MOSTRAR_FECHA_ENTREGA = False
+#   - del todo: borra este bloque y todas las líneas que llevan la marca [FECHA ENTREGA]
+MOSTRAR_FECHA_ENTREGA = True
+
+CSS_FECHA_ENTREGA = """
+.due { flex-shrink: 0; font-size: 18px; font-weight: 400; color: #8A8A8A; white-space: nowrap; }
+.due.hoy { color: #D8D8D8; }
+.due.vencida { color: #E5736B; }
+"""
+# Versión para fondos claros abajo (texto oscuro)
+CSS_FECHA_ENTREGA_TEXTO_OSCURO = """
+.due { color: #6B6B6B; }
+.due.hoy { color: #222222; }
+.due.vencida { color: #B8372E; }
+"""
+
+
+def _fecha_entrega_html(tarea, hoy):
+    """HTML de la fecha de entrega de una tarea ('' si no hay que mostrarla)."""
+    if not MOSTRAR_FECHA_ENTREGA or not isinstance(tarea, dict):
+        return ""
+    if (tarea.get("status") or "").strip().lower() == "done":
+        return ""  # una tarea terminada ya no necesita fecha
+    try:
+        entrega = datetime.date.fromisoformat((tarea.get("due_date") or "")[:10])
+    except ValueError:
+        return ""
+    if entrega.year >= 2099:  # "sin fecha" (el valor de relleno de notion.py)
+        return ""
+
+    dias = (entrega - hoy).days
+    clase = ""
+    if dias < -1:
+        texto, clase = f"vencida hace {-dias} d", "vencida"
+    elif dias == -1:
+        texto, clase = "vencida ayer", "vencida"
+    elif dias == 0:
+        texto, clase = "hoy", "hoy"
+    elif dias == 1:
+        texto = "mañana"
+    elif dias <= 6:
+        texto = f"{DIAS_ES[entrega.weekday()][:3]} {entrega.day}"
+    else:
+        texto = f"{entrega.day} {MESES_ES[entrega.month - 1]}"
+    return f"<div class='due {clase}'>{texto}</div>"
+# ============================================================ fin fecha de entrega
+
+
+def _mime_imagen(datos):
+    """Tipo MIME según los primeros bytes (o None si no parece una imagen)."""
+    if datos.startswith(b"\x89PNG"):
+        return "image/png"
+    if datos.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    if datos[:4] == b"RIFF" and datos[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _calendario_src():
+    """Qué poner dentro de url('...') para el calendario.
+
+    Lo descarga UNA vez al día y lo guarda en cache/. Así cada render no depende de lifecal
+    (más rápido) y si lifecal se cae se usa la copia más reciente."""
+    if CALENDAR_URL.startswith("data:"):
+        return CALENDAR_URL
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    ruta = os.path.join(CACHE_DIR, f"calendario_{datetime.date.today().isoformat()}.img")
+    if not os.path.exists(ruta):
+        try:
+            r = requests.get(CALENDAR_URL, timeout=15)
+            r.raise_for_status()
+            if len(r.content) < 5000 or not _mime_imagen(r.content):
+                raise ValueError("lifecal no devolvió una imagen válida")
+            tmp = ruta + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(r.content)
+            os.replace(tmp, ruta)
+            for vieja in sorted(glob.glob(os.path.join(CACHE_DIR, "calendario_*.img")))[:-3]:
+                os.remove(vieja)  # deja solo las 3 copias más recientes
+        except Exception as e:
+            previas = sorted(glob.glob(os.path.join(CACHE_DIR, "calendario_*.img")))
+            if not previas:
+                log.warning("No pude descargar el calendario (%s); dejo que Chromium lo intente", e)
+                return CALENDAR_URL
+            ruta = previas[-1]
+            log.warning("No pude descargar el calendario (%s); uso la copia %s", e, os.path.basename(ruta))
+    with open(ruta, "rb") as f:
+        datos = f.read()
+    return f"data:{_mime_imagen(datos)};base64," + base64.b64encode(datos).decode()
+
+
+def _css_fuente():
+    """@font-face con Inter incrustada si existe en assets/; si no, Google Fonts como antes."""
+    for ruta in sorted(glob.glob(os.path.join(ASSETS_DIR, "Inter*"))):
+        ext = os.path.splitext(ruta)[1].lower()
+        formato = {".woff2": ("font/woff2", "woff2"), ".ttf": ("font/ttf", "truetype")}.get(ext)
+        if formato:
+            with open(ruta, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            return (f"@font-face {{ font-family: 'Inter'; font-weight: 100 900; font-display: block; "
+                    f"src: url('data:{formato[0]};base64,{b64}') format('{formato[1]}'); }}")
+    return "@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');"
 
 
 @functools.lru_cache(maxsize=8)
@@ -86,7 +221,7 @@ def _cargar_fondo(ruta, mtime):
         return lum, rgb
 
     cal_y0 = CAL_TOP / ALTO
-    cal_y1 = (CAL_TOP + (CAL_ORIG_BOTTOM - CAL_ORIG_TOP) * CAL_ESCALA) / ALTO
+    cal_y1 = (CAL_TOP + (CAL_ORIG_BOTTOM - CAL_ORIG_TOP) * ESCALA_REAL) / ALTO
     lum_cal, _ = zona(cal_y0, cal_y1)      # zona del calendario
     lum_bajo, rgb_bajo = zona(0.78, 0.96)  # zona de las tareas
     return {"uri": uri, "lum_cal": lum_cal, "lum_bajo": lum_bajo, "rgb_bajo": rgb_bajo}
@@ -132,7 +267,7 @@ def _preparar_fondo(ruta, modo="auto"):
         uri=datos["uri"], brillo=round(brillo, 3), r=r, g=g, b=b,
         inicio=inicio, fin=fin, alpha=alpha, contraste=round(CAL_CONTRASTE, 3),
         mezcla="difference" if claro else "screen",
-        recorte=f"clip-path: inset(0 0 {ALTO - CAL_ORIG_PIE}px 0);" if pie else "",
+        recorte=f"clip-path: inset(0 0 {REF_H - CAL_ORIG_PIE}px 0);" if pie else "",
     )
     if pie:
         css += Template("""
@@ -200,8 +335,11 @@ def crear_imagen(tareas, output_path="wallpaper.png", fondo=None, modo="auto"):
     visibles += hechas[:MAX_TAREAS - len(visibles)]  # si sobra espacio, entran más Done
     extra = len(tareas_ordenadas) - len(visibles)
 
+    # El calendario se escala desde el borde superior de su contenido y luego se mueve a CAL_TOP
+    hoy = datetime.date.today()
+    desplazamiento_x = (ANCHO - REF_W) / 2
     desplazamiento_y = CAL_TOP - CAL_ORIG_TOP
-    margen_x = round((ANCHO - CAL_ORIG_ANCHO * CAL_ESCALA) / 2)
+    margen_x = round((ANCHO - CAL_ORIG_ANCHO * ESCALA_REAL) / 2)
 
     tareas_html = ""
     for t in visibles:
@@ -209,16 +347,17 @@ def crear_imagen(tareas, output_path="wallpaper.png", fondo=None, modo="auto"):
             t = {"titulo": t, "prioridad": "", "color": "default", "status": "Not started"}
 
         color_hex = colores_notion.get(t.get("color", "default"), "#8D99AE")
-        estado = t.get("status", "Not started")
+        estado = (t.get("status") or "").strip().lower()
 
         clase_estado = "task-normal"
-        if estado == "In progress":
+        if estado == "in progress":
             clase_estado = "task-in-progress"
-        elif estado == "Done":
+        elif estado == "done":
             clase_estado = "task-done"
 
-        titulo = html.escape(t["titulo"])
-        prioridad = html.escape(t.get("prioridad", ""))
+        titulo = html.escape(t.get("titulo") or "(sin título)")
+        prioridad = html.escape(t.get("prioridad") or "")
+        due_html = _fecha_entrega_html(t, hoy)  # [FECHA ENTREGA]
 
         tag_html = (
             f"<div class='priority-tag' style='color: {color_hex}; "
@@ -232,42 +371,50 @@ def crear_imagen(tareas, output_path="wallpaper.png", fondo=None, modo="auto"):
                 <div class='status-indicator'></div>
                 <div class='task-title'>{titulo}</div>
             </div>
+            {due_html}<!-- [FECHA ENTREGA] -->
             {tag_html}
         </li>
         """
 
     more_html = f"<div class='more'>+{extra} más</div>" if extra > 0 else ""
-    fecha_hoy = datetime.datetime.now().strftime("%A, %d %b")
+    fecha_hoy = _fecha_hoy_es(hoy)
 
     # Fondo con imagen: añade capas y CSS extra. Sin imagen, todo queda exactamente como antes.
     if fondo:
         css_fondo, capas_fondo, info = _preparar_fondo(fondo, modo)
-        print("Fondo:", os.path.basename(fondo), info)
+        log.info("Fondo: %s %s", os.path.basename(fondo), info)
     else:
         css_fondo = capas_fondo = ""
+
+    css_fecha = ""  # [FECHA ENTREGA]
+    if MOSTRAR_FECHA_ENTREGA:  # [FECHA ENTREGA]
+        css_fecha = CSS_FECHA_ENTREGA + (CSS_FECHA_ENTREGA_TEXTO_OSCURO if fondo and info["texto_oscuro"] else "")  # [FECHA ENTREGA]
+
+    calendario_src = _calendario_src()
+    css_fuente = _css_fuente()
 
     html_content = f"""
     <!DOCTYPE html>
     <html>
     <head>
         <style>
-            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+            {css_fuente}
 
             * {{ box-sizing: border-box; }}
 
             body {{
-                margin: 0; padding: 0; width: 1179px; height: 2556px;
+                margin: 0; padding: 0; width: {ANCHO}px; height: {ALTO}px;
                 background-color: #1a1a1a; 
                 color: #FFFFFF; font-family: 'Inter', sans-serif;
                 position: relative; overflow: hidden;
             }}
 
             .bg {{
-                position: absolute; inset: 0;
-                background: url('{CALENDAR_URL}') no-repeat center center;
+                position: absolute; left: 0; top: 0; width: {REF_W}px; height: {REF_H}px;
+                background: url('{calendario_src}') no-repeat 0 0 / 100% 100%;
                 filter: grayscale(1);
                 transform-origin: 50% {CAL_ORIG_TOP}px;
-                transform: translateY({desplazamiento_y}px) scale({CAL_ESCALA});
+                transform: translate({desplazamiento_x}px, {desplazamiento_y}px) scale({ESCALA_REAL});
             }}
 
             .tasks-container {{
@@ -318,6 +465,8 @@ def crear_imagen(tareas, output_path="wallpaper.png", fondo=None, modo="auto"):
 
             .more {{ padding-top: 14px; font-size: 18px; font-weight: 300; color: #6E6E6E; }}
 
+            {css_fecha}  /* [FECHA ENTREGA] */
+
             {css_fondo}
         </style>
     </head>
@@ -338,15 +487,26 @@ def crear_imagen(tareas, output_path="wallpaper.png", fondo=None, modo="auto"):
     </html>
     """
 
+    tmp_path = output_path + ".tmp.png"
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(viewport={"width": ANCHO, "height": ALTO})
-        page.set_content(html_content)
+        # --disable-dev-shm-usage: en Docker /dev/shm es pequeño y Chromium se cae con imágenes grandes
+        browser = p.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
+        try:
+            page = browser.new_page(viewport={"width": ANCHO, "height": ALTO})
+            page.set_default_timeout(20000)
+            page.set_content(html_content, wait_until="load", timeout=20000)
 
-        page.wait_for_load_state("networkidle")
-        page.evaluate("document.fonts.ready.then(() => true)")
+            # Con calendario y fuente locales no hay red que esperar; si hubiera (Google Fonts,
+            # calendario remoto) esperamos un poco, pero sin bloquear el render si tarda.
+            try:
+                page.wait_for_load_state("networkidle", timeout=8000)
+            except PlaywrightTimeout:
+                log.warning("La red no quedó inactiva en 8 s; sigo con lo que hay")
+            page.evaluate("document.fonts.ready.then(() => true)")
 
-        page.screenshot(path=output_path)
-        browser.close()
+            page.screenshot(path=tmp_path)
+        finally:
+            browser.close()
+    os.replace(tmp_path, output_path)  # nunca queda un PNG a medias
 
     return output_path
